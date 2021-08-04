@@ -4,12 +4,15 @@ import (
 	"encoding/json"
 
 	"github.com/gofrs/uuid"
+
+	srv "github.com/ytsiuryn/ds-microservice"
 )
 
+// AudioRepoRequest описывает формат запроса к менеджеру БД для аудио метаданных.
 type AudioRepoRequest struct {
-	Cmd      string `json:"cmd"`
-	Path     string `json:"path"`
-	FullList bool   `json:"full_list"`
+	Cmd   string             `json:"cmd"`
+	Path  string             `json:"path,omitempty"`
+	Error *srv.ErrorResponse `json:"error,omitempty"`
 }
 
 // CreateRepoRequest формирует данные запроса по репозиторию.
@@ -35,10 +38,10 @@ func CreateEntryRequest(cmd, path string) (string, []byte, error) {
 }
 
 // ParseRepoAnswer разбирает ответ по репозиторию.
-func ParseRepoAnswer(data []byte) (map[Path]entryProperty, error) {
-	entries := map[Path]entryProperty{}
-	if err := json.Unmarshal(data, &entries); err != nil {
+func ParseRepoAnswer(data []byte) (*AudioRepoRequest, error) {
+	req := AudioRepoRequest{}
+	if err := json.Unmarshal(data, &req); err != nil {
 		return nil, err
 	}
-	return entries, nil
+	return &req, nil
 }

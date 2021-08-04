@@ -6,52 +6,108 @@ import (
 	"io/ioutil"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
-	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/streadway/amqp"
 
+	dbm "github.com/ytsiuryn/ds-audiodbm"
+	ent "github.com/ytsiuryn/ds-audiodbm/entity"
 	md "github.com/ytsiuryn/ds-audiomd"
 	srv "github.com/ytsiuryn/ds-microservice"
 )
 
-const ServiceName = "repokeeper"
-
-type entryProperty struct {
-	LastUpdate int64    `json:"last_update,omitempty"`
-	Status     FSStatus `json:"status"`
-	Normalized bool     `json:"normalized,omitempty"`
-}
+// Константы микросервиса
+const (
+	ServiceName = "repokeeper"
+	CacheFile   = ".cache"
+)
 
 // RepoKeeper описывает внутреннее состояние хранителя репозитория.
 type RepoKeeper struct {
 	*srv.Service
 	rootDir    string
 	extensions []string
-	cacheFile  string
-	entries    map[Path]entryProperty
-	lastUpdate time.Time
+	cl         *srv.RPCClient
+	w          *fsnotify.Watcher
+	entries    *Entries
 }
 
 // New создает объект хранителя репозитория.
+// Корневой каталог аудио рпеозитори должен быть указан как абсолютный путь.
 func New(rootDir string, extensions []string) *RepoKeeper {
+	if !filepath.IsAbs(rootDir) {
+		srv.FailOnError(
+			errors.New("audio repository root dir must be an absolute path"),
+			"service parameters parsing")
+	}
+
+	w, err := fsnotify.NewWatcher()
+	srv.FailOnError(err, "watcher initialization")
+
+	err = w.Add(rootDir)
+	srv.FailOnError(err, "watch point adding")
+
 	return &RepoKeeper{
 		Service:    srv.NewService(ServiceName),
+		cl:         srv.NewRPCClient(),
 		rootDir:    rootDir,
 		extensions: extensions,
-		cacheFile:  ".cache",
-		entries:    map[Path]entryProperty{},
-	}
+		w:          w,
+		entries:    NewEntries(rootDir, extensions)}
 }
 
-// Start запускает Web Poller и цикл обработки взодящих запросов.
+// AnswerWithError заполняет структуру ответа информацией об ошибке.
+func (rk *RepoKeeper) AnswerWithError(delivery *amqp.Delivery, err error, context string) {
+	rk.LogOnError(err, context)
+	req := &AudioRepoRequest{
+		Error: &srv.ErrorResponse{
+			Error:   err.Error(),
+			Context: context,
+		},
+	}
+	data, err := json.Marshal(req)
+	srv.FailOnError(err, "answer marshalling error")
+	rk.Answer(delivery, data)
+}
+
+// Start запускает Web Poller и цикл обработки входящих запросов.
 // Контролирует сигнал завершения цикла и последующего освобождения ресурсов микросервиса.
 func (rk *RepoKeeper) Start(msgs <-chan amqp.Delivery) {
 	c := make(chan os.Signal)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
+	// контроль изменений между запусками и проведение их на БД
+	go func() {
+		err := rk.entries.Calculate(rk.rootDir)
+		srv.FailOnError(err, "entry cache creation")
+		// проведение изменений с момента последнего формирования кеша и по настоящий момент
+		oldParents := NewEntries(rk.rootDir, rk.extensions)
+		if err := oldParents.LoadFrom(CacheFile); err == nil {
+			for path, mod := range rk.entries.Compare(oldParents) {
+				switch mod.Change {
+				case CreatedFsChange:
+					rk.createEntry(path)
+				case RenamedFsChange:
+					rk.renameEntry(path, mod.NewName)
+				case DeletedFsChange:
+					rk.deleteEntry(path)
+				}
+			}
+		} else {
+			if os.IsExist(err) {
+				// if err != os.ErrNotExist {
+				srv.FailOnError(err, "cache reading")
+			}
+		}
+		rk.fsEvents()
+	}()
+
+	// обработка клиентских запросов
 	go func() {
 		for delivery := range msgs {
+			rk.Log.Info("Новое сообщение")
 			var req AudioRepoRequest
 			if err := json.Unmarshal(delivery.Body, &req); err != nil {
 				rk.AnswerWithError(&delivery, err, "Message dispatcher")
@@ -69,118 +125,135 @@ func (rk *RepoKeeper) Start(msgs <-chan amqp.Delivery) {
 }
 
 func (rk *RepoKeeper) cleanup() {
+	if err := rk.entries.SaveTo(CacheFile); err != nil {
+		rk.Log.Error(err)
+	}
+	if err := rk.w.Close(); err != nil {
+		rk.Log.Error(err)
+	}
 	rk.Service.Cleanup()
 }
 
 // Отображение сведений о выполняемом запросе.
 func (rk *RepoKeeper) logRequest(req *AudioRepoRequest) {
 	if len(req.Path) > 0 {
-		rk.Log.WithField("args", req.Path).Info(req.Cmd + "()")
+		rk.Log.Infof("%s(%s)", req.Cmd, req.Path)
 	} else {
-		rk.Log.Info(req.Cmd + "()")
+		rk.Log.Infof("%s()", req.Cmd)
 	}
 }
 
 // RunCmd выполняет команды и возвращает результат клиенту в виде JSON-сообщения.
 func (rk *RepoKeeper) RunCmd(req *AudioRepoRequest, delivery *amqp.Delivery) {
+	var data []byte
+	var err error
+
 	switch req.Cmd {
-	case "update":
-		rk.updateEntryList(req.FullList, delivery)
 	case "normalize":
-		rk.normalize(req.Path, delivery)
+		data, err = rk.normalize(req)
 	default:
 		rk.Service.RunCmd(req.Cmd, delivery)
+		return
 	}
-}
 
-func (rk *RepoKeeper) LoadCache() {
-	rk.entries = map[Path]entryProperty{}
-	data, err := os.ReadFile(rk.cacheFile)
 	if err != nil {
-		if !errors.Is(err, os.ErrExist) {
-			if os.WriteFile(rk.cacheFile, []byte{}, 0644) != nil {
-				rk.Log.WithField("error", err).Error("Cache creating")
-			}
-		} else {
-			rk.Log.WithField("error", err).Error("Cache reading")
-		}
-		return
-	}
-	if len(data) == 0 {
-		rk.Log.Warn("Cache file is empty")
-		return
-	}
-	if err := json.Unmarshal(data, &rk.entries); err != nil {
-		rk.Log.WithField("error", err).Error("Cache unmarshalling")
-	}
-}
-
-// Создание/обновление кеша списка каталогов альбомов и их свойств.
-// Каталог альбомов трактуется по наличию файлов с поддерживаемыми системой аудиофайлами
-// выполняется сравнение фактического состояния с кэшем состояния, полученным в результате
-// последней проверки.
-func (rk *RepoKeeper) updateEntryList(fullList bool, delivery *amqp.Delivery) {
-	entries := map[Path]int64{}
-	diff := map[Path]entryProperty{}
-	haveChanges := false
-	if err := rk.albumEntries(rk.rootDir, entries); err != nil {
-		rk.AnswerWithError(delivery, err, "Getting entries")
-		return
-	}
-	prop := entryProperty{}
-	for cachePath := range rk.entries {
-		nsecs, ok := entries[cachePath]
-		if !ok {
-			prop.Status = DeletedFSStatus
-			prop.LastUpdate = 0
-		} else {
-			if rk.entries[cachePath].LastUpdate < nsecs {
-				prop.Status = UpdatedFSStatus
-			} else {
-				prop.Status = 0
-			}
-			prop.LastUpdate = nsecs
-		}
-		if prop.Status != 0 {
-			diff[cachePath] = prop
-			haveChanges = true
-		}
-	}
-	for path, nsecs := range entries {
-		if _, ok := rk.entries[path]; !ok {
-			prop.Status = CreatedFSStatus
-			prop.LastUpdate = nsecs
-			diff[path] = prop
-			haveChanges = true
-		}
-	}
-	for path, prop := range diff {
-		rk.entries[path] = prop
-	}
-	var out map[Path]entryProperty
-	if fullList {
-		out = rk.entries
+		rk.AnswerWithError(delivery, err, req.Cmd)
 	} else {
-		out = diff
+		if len(data) > 0 {
+			rk.Log.Debug(string(data))
+		}
+		rk.Answer(delivery, data)
 	}
-	defer func() {
-		for path, prop := range rk.entries {
-			if prop.Status == DeletedFSStatus {
-				delete(rk.entries, path)
+}
+
+func (rk *RepoKeeper) fsEvents() {
+	for {
+		select {
+		// TODO: обрабатывать ситуации переноса многодисковых треков в общий верхний каталог
+		// TODO: а что будет при рекурсивном удалении?
+		case event, ok := <-rk.w.Events:
+			if !ok {
+				rk.Log.Error("fsnotify event retriving error")
+				return
+			}
+			rk.Log.Debug("event:", event)
+			if event.Op&fsnotify.Create == fsnotify.Create {
+				rk.createEntry(event.Name)
+			} else if event.Op&fsnotify.Rename == fsnotify.Rename {
+				// rk.renameEntry(event.Name, "")
+			} else if event.Op&fsnotify.Remove == fsnotify.Remove {
+				rk.deleteEntry(event.Name)
+			} else {
+				rk.Log.Debug("unprocessed event: ", event)
+			}
+		case err, ok := <-rk.w.Errors:
+			if !ok {
+				rk.Log.Error("fsnotify error retriving error")
+				return
+			}
+			rk.Log.Error(err)
+		}
+	}
+}
+
+func (rk *RepoKeeper) createEntry(path string) {
+	if rk.isAlbumEntry(path) {
+		req := dbm.NewAudioDBRequest("set_entry", &ent.AlbumEntry{Path: path})
+		rk.dbmRequestAnswer(req)
+		rk.Log.Debug("album entry created: ", path)
+	}
+}
+
+func (rk *RepoKeeper) renameEntry(oldPath, newPath string) {
+	if rk.isAlbumEntry(oldPath) {
+		req := dbm.NewAudioDBRequest("rename_entry", &ent.AlbumEntry{Path: oldPath})
+		req.NewPath = newPath
+		rk.dbmRequestAnswer(req)
+		rk.Log.Debug("album entry renamed: ", oldPath)
+	}
+}
+
+func (rk *RepoKeeper) deleteEntry(path string) {
+	if rk.isAlbumEntry(path) {
+		req := dbm.NewAudioDBRequest("delete_entry", &ent.AlbumEntry{Path: path})
+		rk.dbmRequestAnswer(req)
+		rk.Log.Debug("album entry deleted: ", path)
+	}
+}
+
+func (rk *RepoKeeper) dbmRequestAnswer(req *dbm.AudioDBRequest) {
+	corrID, data, err := req.Create()
+	srv.FailOnError(err, "dbm request sending")
+	rk.cl.Request(dbm.ServiceName, corrID, data)
+	resp, err := srv.ParseErrorAnswer(rk.cl.Result(corrID))
+	srv.FailOnError(err, "dbm response receiving")
+	if resp.Error != "" {
+		srv.FailOnError(err, "dbm request processing")
+	}
+}
+
+// в случае ошибки каталог воспринимается не как аудио каталог для блокировки действий по нему
+func (rk *RepoKeeper) isAlbumEntry(path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		rk.Log.Error(err)
+		return false
+	}
+	if !fi.IsDir() {
+		return false
+	}
+	files, err := ioutil.ReadDir(path)
+	if err != nil {
+		return false
+	}
+	for _, info := range files {
+		if !info.IsDir() {
+			if rk.entries.isSupportedAudio(info.Name()) {
+				return true
 			}
 		}
-	}()
-	answerJSON, err := json.Marshal(out)
-	if err != nil {
-		rk.AnswerWithError(delivery, err, "Response")
-		return
 	}
-	if haveChanges {
-		go func() {
-			ioutil.WriteFile(rk.cacheFile, answerJSON, 0x644)
-		}()
-	}
-	rk.Answer(delivery, answerJSON)
+	return false
 }
 
 // нормализация имени каталога, исходя из метаданных альбома
@@ -188,7 +261,8 @@ func (rk *RepoKeeper) updateEntryList(fullList bool, delivery *amqp.Delivery) {
 // - нормализовать один каталог с альбомом или все
 // - путь к каталогу альбома для единичной нормализации
 // - JSON для объекта ds_audiomd.Release
-func (rk *RepoKeeper) normalize(path string, delivery *amqp.Delivery) {
+func (rk *RepoKeeper) normalize(req *AudioRepoRequest) (_ []byte, err error) {
+	return
 }
 
 // IsReadyForNormalization проверка наличия всех необходимых метаданных

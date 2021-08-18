@@ -39,7 +39,6 @@ func TestAudioRepoKeeper(t *testing.T) {
 func startTestService(dir string) {
 	curDir, _ := filepath.Abs(dir)
 	testService := New(curDir, []string{".mp3", ".flac", ".dsf", ".wv"})
-	msgs := testService.ConnectToMessageBroker("amqp://guest:guest@localhost:5672/")
 	testService.Log.SetLevel(log.DebugLevel)
-	go testService.Start(msgs)
+	go testService.StartWithConnection("amqp://guest:guest@localhost:5672/")
 }

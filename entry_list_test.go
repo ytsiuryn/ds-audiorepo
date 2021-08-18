@@ -32,18 +32,15 @@ func TestEntriesCompare(t *testing.T) {
 	for k, v := range old.Cache {
 		ent.Cache[k] = v
 	}
-	for k, v := range old.m {
-		ent.m[k] = v
-	}
 
 	require.NoError(t, os.Mkdir("testdata/repo/other_mp3", os.ModeDir))
 	defer func() { os.Remove("testdata/repo/other_mp3") }()
-	fi, err := os.Stat("testdata/repo/other_mp3")
-	require.NoError(t, err)
-	ent.m["testdata/repo/other_mp3"] = fi
-	require.NoError(t, ent.Add("testdata/repo/other_mp3"))
-	require.NoError(t, ent.Delete("testdata/repo/flac"))
-	require.NoError(t, ent.Rename("testdata/repo/wv/wv", "testdata/repo/wv/wv2"))
+	// fi, err := os.Stat("testdata/repo/other_mp3")
+	// require.NoError(t, err)
+	// ent.m["testdata/repo/other_mp3"] = fi
+	ent.AddAlbumEntry("testdata/repo/other_mp3")
+	ent.Delete("testdata/repo/flac")
+	ent.Rename("testdata/repo/wv/wv", "testdata/repo/wv/wv2")
 	assert.Len(t, ent.Cache, 8)
 
 	changes := ent.Compare(old)

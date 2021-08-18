@@ -1,0 +1,30 @@
+{
+    "testdata/repo": {
+        "inode": 658593,
+        "children": ["testdata/repo/dsf", "testdata/repo/flac", "testdata/repo/mp3", "testdata/repo/wv"]
+    },
+    "testdata/repo/dsf": {
+        "inode": 658597,
+        "children": ["testdata/repo/dsf/dsf"]
+    },
+    "testdata/repo/dsf/dsf": {
+        "inode": 658598
+    },
+    "testdata/repo/flac": {
+        "inode": 658594
+    },
+    "testdata/repo/mp3": {
+        "inode": 658600
+    },
+    "testdata/repo/wv": {
+        "inode": 658602,
+        "children": ["testdata/repo/wv/wv"]
+    },
+    "testdata/repo/wv/wv": {
+        "inode": 658603,
+        "children": ["testdata/repo/wv/wv/wv"]
+    },
+    "testdata/repo/wv/wv/wv": {
+        "inode": 658608
+    }
+}

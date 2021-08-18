@@ -2,6 +2,7 @@ package repokeeper
 
 import (
 	"encoding/json"
+	"errors"
 
 	"github.com/gofrs/uuid"
 
@@ -10,9 +11,23 @@ import (
 
 // AudioRepoRequest описывает формат запроса к менеджеру БД для аудио метаданных.
 type AudioRepoRequest struct {
-	Cmd   string             `json:"cmd"`
-	Path  string             `json:"path,omitempty"`
+	Cmd  string `json:"cmd"`
+	Path string `json:"path,omitempty"`
+}
+
+// AudioRepoResponse описывает формат запроса к менеджеру БД для аудио метаданных.
+type AudioRepoResponse struct {
+	*AudioRepoRequest
 	Error *srv.ErrorResponse `json:"error,omitempty"`
+}
+
+// Unwrap проверяется возвращает ли ответ описание ошибки и, если она есть,
+// выводится сообщение об ощибке по данным ответа и процесс с клиентом останавливается.
+func (resp *AudioRepoResponse) Unwrap() *AudioRepoRequest {
+	if resp.Error != nil {
+		srv.FailOnError(errors.New(resp.Error.Error), resp.Error.Context)
+	}
+	return resp.AudioRepoRequest
 }
 
 // CreateRepoRequest формирует данные запроса по репозиторию.
